@@ -1,0 +1,1408 @@
+---
+title: "UoC Prostate cancer pathway analysis"
+author: "Aleks Zakirov"
+output:
+  html_document:
+    df_print: paged
+editor_options: 
+  chunk_output_type: inline
+---
+
+
+# Define functions
+
+```{r}
+library(janitor)
+library(ggplot2)
+library(ggrepel)
+library(rjson)
+library(factoextra)
+library(tidyverse)
+library(RColorBrewer)
+
+# add a list of custom functions for the analysis
+source('functions_file.R')
+
+# latest KEGG db path
+kegg_path = 'Resource_tables/complete_KEGG_LM_map_db.csv'
+
+```
+
+# Load data from SCiLS
+
+```{r}
+
+# Load negative data
+mb_dat_neg_bg = read.csv("Data/Prostate_UoC_v2_reimported_with_background.csv", skip = 8, sep = ';')
+
+# clean up the column names
+mb_dat_neg_bg = mb_dat_neg_bg %>% janitor::clean_names()
+
+# peaks and intervals for export to Jack
+peaks_and_tolerances = mb_dat_neg_bg %>% select(m_z, interval_width_da) %>% arrange(m_z)
+
+#write.csv(peaks_and_tolerances, 'Data/peaks_and_tolerances_BG_all.csv', row.names = F)
+
+mb_dat_neg_bg = mb_dat_neg_bg[,colnames(mb_dat_neg_bg)[grep('m_z|maximum', colnames(mb_dat_neg_bg))]]
+
+# remove "average_intensity_peak_maximum" and "_root_mean_square" from the column names
+mb_dat_neg_bg = mb_dat_neg_bg %>% rename_with(~gsub("maximum_mean_value_", "", .x))
+mb_dat_neg_bg = mb_dat_neg_bg %>% rename_with(~gsub("_root_mean_square", "", .x))
+colnames(mb_dat_neg_bg)[1] = 'mz' #fix mz column name
+
+# drop unneeded columns
+# mb_dat_neg_bg = mb_dat_neg_bg %>% select(-c(interval_width_da, color))
+
+head(mb_dat_neg_bg)
+
+# remove everything after the first space in the mz column
+mb_dat_neg_bg$mz= gsub(" .*", "", mb_dat_neg_bg$mz)
+# convert to numeric
+mb_dat_neg_bg$mz = as.numeric(mb_dat_neg_bg$mz)
+
+
+# list all samples (columns) in the dataset
+colnames(mb_dat_neg_bg)[2:ncol(mb_dat_neg_bg)]
+
+```
+
+# Perform comparison for experimental groups
+
+```{r}
+# compare malignant vs benign samples
+pat1 = "m_"
+pat2 = "b_"
+compar_name = paste(pat1, pat2, 'whole_tissue_RMS_BG', sep = '.')
+
+# perform comparison between the groups
+# results are saved in "Data/m_.b_.whole_tissue_RMS_BG_fc_pval_results.csv"
+get_group_fc_results(data = mb_dat_neg_bg, 
+                     pattern1 = pat1, 
+                     pattern2 = pat2, 
+                     comparison_name = compar_name, 
+                     pval_type = 'pval', 
+                     save = T, 
+                     cust_column_name = 'mode', 
+                     cust_column_value = 'negative')
+```
+
+# Map peaks
+
+```{r}
+
+results_path_mal_ben = 'Data/m_.b_.whole_tissue_RMS_BG_fc_pval_results.csv'
+
+mode = 'negative'
+
+matched_peaks_mal_ben = customPeakMap(
+  kegg_path = kegg_path,
+  results_path = results_path_mal_ben,
+  path_size = 2,
+  ppm = 5,
+  mode = mode
+  )
+
+# filter to keep only peaks belonging to human pathways and peaks with p<0.05
+filt_matched_peaks_mal_ben = matched_peaks_mal_ben %>% filter(human_pathway == 'True', pvalue < 0.05)
+
+# list of significant peaks
+signif_mapped_peaks = filt_matched_peaks_mal_ben %>% pull(exp_peak) %>% unique()
+
+```
+
+# Background enriched peaks
+
+```{r}
+bg_peaks = mb_dat_neg_bg %>% 
+  select(mz, background, tissue) %>% 
+  mutate(fc = background/tissue) %>%
+  mutate(log2fc = log2(fc)) %>% 
+  filter(log2fc > 1)
+
+
+# significant background peaks to generate ion images for review
+signif_bg_peaks = bg_peaks %>% filter(mz %in% signif_mapped_peaks)
+                     
+```
+
+At this stage need to import peaks into SCiLS and generate ion images for expert review
+
+# Read ion images names
+
+```{r}
+
+true_bg_peaks = list.files(path = 'Images/background_ion_images/background_ion_images_Lucy/')
+true_bg_peaks = as.numeric(gsub('mz_|\\(.*', '', true_bg_peaks))
+
+# manual checked extra bg peaks
+manual_bg_checked_peaks = c(125.0009, 127.0037, 180.9895, 171.1390, 181.1599, 199.1707, 143.1078, 122.9851, 259.0222)
+
+true_bg_peaks = c(true_bg_peaks, manual_bg_checked_peaks)
+
+true_bg_peaks
+
+```
+
+# Remove background peaks
+
+```{r}
+
+filt_matched_peaks_mal_ben = filt_matched_peaks_mal_ben %>% filter(!exp_peak %in% true_bg_peaks)
+
+```
+
+# Peaks for ROI
+
+```{r}
+# export peaks manually for ROI-based data generation
+peaks_for_jack = peaks_and_tolerances %>% filter(m_z %in% unique(filt_matched_peaks_mal_ben$exp_peak))
+```
+
+
+# Read ROI data
+
+```{r}
+
+# read ROI-based peaks data
+roi_data_in = read.csv('Data/ROI_metabolite_data_zakirov_biglist.csv')
+
+# add unique sample ID
+roi_data_in = roi_data_in %>% 
+  mutate(unique_id = paste0(Sample.ID, '_', Annotation.ID), .before = Annotation.ID)
+
+# make annotation clean
+roi_data_in = roi_data_in %>%
+  mutate(annotation_clean = sapply(Annotation, janitor::make_clean_names, USE.NAMES = F), .after = Annotation)
+
+# clean up some poorly named entries
+roi_data_in = roi_data_in %>% 
+  mutate(
+    annotation_clean = 
+      gsub('porly', 'poorly', annotation_clean),
+    annotation_clean = 
+      gsub('gp3_epithelium', 'epithelium_gp3', annotation_clean),
+    annotation_clean = 
+      gsub('epithelium_benign_close_to_gp3', 'benign_epithelium_close_to_gp3', annotation_clean),
+    annotation_clean = 
+      gsub('benigng_epithelium_close_to_gp3', 'benign_epithelium_close_to_gp3', annotation_clean),
+    annotation_clean = 
+      gsub('benign_epithelium_next_to_gp3', 'benign_epithelium_close_to_gp3', annotation_clean),
+    annotation_clean = 
+      gsub('benign_epithelium_next_to_gp4', 'benign_epithelium_close_to_gp4', annotation_clean)
+    )
+
+# print unique annotations
+print(
+  unique(roi_data_in$annotation_clean)
+)
+
+
+# collapse by sample id and annotation_clean to get the averages for each ROI type per tissue
+roi_data = roi_data_in %>% 
+  select(-c(unique_id, Annotation.ID, Annotation, Tissue.Classification)) %>% 
+  group_by(Sample.ID, annotation_clean) %>% 
+  summarise_all(mean) %>% 
+  ungroup()
+
+# make unique column names and transpose data
+roi_data = roi_data %>% 
+  mutate(annotation_clean = janitor::make_clean_names(annotation_clean, use_make_names = T)) %>% 
+  select(-Sample.ID) %>% 
+  column_to_rownames('annotation_clean') %>% 
+  t() %>% 
+  data.frame()
+
+# clean the mz values
+roi_data = roi_data %>% 
+  rownames_to_column('mz') %>% 
+  mutate(mz = as.numeric(gsub('X', '', mz)))
+
+# remove background peaks
+roi_data_wo_bg = roi_data %>% filter(!mz %in% round(true_bg_peaks,4))
+
+```
+
+# FC ROI comparisons
+
+```{r}
+# benign vs tumour epithelium
+pat1 = "benign_epithelium"
+pat2 = "tumour_epithelium"
+compar_name = paste(pat1, pat2, 'neg_RMS_woBG_biglist', sep = '.')
+
+ROI_fc_table = get_group_fc_results(data = roi_data_wo_bg, 
+                                    pattern1 = pat1, 
+                                    pattern2 = pat2, 
+                                    comparison_name = compar_name, 
+                                    pval_type = 'pval', 
+                                    save = T, 
+                                    cust_column_name = 'mode', 
+                                    cust_column_value = 'negative')
+
+# path for results (for pathway analysis)
+result_files = list.files(path = 'Data', pattern = '.*tumour.*neg_RMS_woBG_biglist_fc_pval_results', full.names = T)
+
+
+```
+
+# Prepare pathway dict
+
+```{r}
+# this generates peak-to-pathway mapping database
+kegg_db = read.csv(kegg_path)
+
+# filter no path
+kegg_db = kegg_db[kegg_db$pathway_id != '',]
+# keep only human pathways
+kegg_db_human = kegg_db[kegg_db$human_pathway == 'True',]
+
+
+# prepare a pathway:peak dictionary
+path_list_human = unique(kegg_db_human$pathway_name)
+names(path_list_human) = path_list_human
+
+pathway2peaks_human = lapply(path_list_human, function (x) {
+  a = unique(kegg_db_human[kegg_db_human$pathway_name == x,]$complete_compound_mass)
+  a[!is.na(a)]
+})
+
+# keep only pathways with < 500 and > 1 entries
+pathway2peaks_human = pathway2peaks_human[which(lapply(pathway2peaks_human, length) < 500 & lapply(pathway2peaks_human, length) > 1)]
+
+```
+
+# Perform ORA
+
+```{r}
+
+# perform peak mapping
+matched_peak_list_ROI = lapply(result_files, function(x) {
+  
+  customPeakMap(kegg_path = kegg_path, 
+                results_path = x, 
+                path_size = 2, 
+                ppm = 5, 
+                mode = mode)
+})
+
+# name the list
+names(matched_peak_list_ROI) = gsub('Data/|.neg.*', '', result_files)
+
+# filter out entries without pathway
+filt_matched_peak_list_ROI = lapply(matched_peak_list_ROI, function(x) x[x$pathway_id != '',])
+
+# filter out non-significant entries
+filt_matched_peak_list_ROI = lapply(filt_matched_peak_list_ROI, function(x) x[x$pvalue <= 0.05,])
+
+# split into up- and down-regulated based on FC
+p005up_list = lapply(filt_matched_peak_list_ROI, function(x) x[x$mean_fc > 1,])
+p005down_list = lapply(filt_matched_peak_list_ROI, function(x) x[x$mean_fc < 1,])
+
+# get the unique peaks
+uniq_sign_peaks_up_list = lapply(p005up_list, function(x) unique(x$mz))
+uniq_sign_peaks_down_list = lapply(p005down_list, function(x) unique(x$mz))
+
+# compute ORA
+ora_up_list = lapply(uniq_sign_peaks_up_list, function(x) {
+  if (length(x) != 0) {
+    compute_ORA(cpd_vector = x, path_set = pathway2peaks_human, hit_filt = 0)}})
+
+ora_down_list = lapply(uniq_sign_peaks_down_list, function(x) {
+  if (length(x) != 0) {
+    compute_ORA(cpd_vector = x, path_set = pathway2peaks_human, hit_filt = 0)}})
+
+# add direction to the ORA results
+ora_up_list = lapply(ora_up_list, function(x) cbind(x, direction = 'up'))
+ora_down_list = lapply(ora_down_list, function(x) cbind(x, direction = 'down'))
+
+# combine up- and down-regulated ORA results
+ora_list = lapply(1:length(ora_up_list), function(x) rbind(ora_up_list[[x]], ora_down_list[[x]]))
+
+# clean up names
+names(ora_list) = gsub('Data/|.neg.*', '', result_files)
+
+# drop comparisons without any pathways (keep only comparisons that are data frames)
+ora_list = ora_list[lapply(ora_list, class) == 'data.frame']
+
+# process ORA results
+ora_list = lapply(ora_list, function(x) {
+  x %>%
+  dplyr::mutate(FC = hits/expected, .after = FDR) %>% 
+  dplyr::mutate(log2FC = log2(hits/expected), .after = FC) %>% 
+  mutate(FC = ifelse(direction == 'down', FC*-1, FC)) %>% 
+  mutate(log2FC = ifelse(direction == 'down', log2FC*-1, log2FC)) %>% 
+  rownames_to_column('Pathway') %>%
+  # remove number 1 from the ends of the pathway names (appears after merging two dfs when both up and down regulated df has the pathway)
+  mutate(Pathway = gsub('1$', '', Pathway))
+  
+})
+
+```
+
+# GTF Pathways of interest
+
+```{r}
+# check if Glycolysis is in the list
+lapply(ora_list, function(x) any(grepl('Glycolysis', x$Pathway)))
+
+# check if TCA cycle is in the list
+lapply(ora_list, function(x) any(grepl('TCA', x$Pathway)))
+
+# check if FA synthesis is in the list
+lapply(ora_list, function(x) any(grepl('Fatty acid', x$Pathway)))
+
+```
+
+```{r}
+# extract data for pathways of interest
+
+interesting_pathways = data.frame()
+for (i in 1:length(ora_list)) {
+  # add dataset name as a column
+  temp_path = ora_list[[i]]
+  temp_path$dataset = names(ora_list)[i]
+  # filter out only interesting pathways
+  temp_path = temp_path[grepl('Glycolysis|TCA|Fatty acid biosynthesis', temp_path$Pathway),]
+  # add to the main df
+  interesting_pathways = rbind(interesting_pathways, temp_path)
+}
+
+# remove 'epithelium' from the dataset names
+interesting_pathways$dataset = gsub('_epithelium', '', interesting_pathways$dataset)
+# remove ".neg" and everything after 
+interesting_pathways$dataset = gsub('\\.neg.*', '', interesting_pathways$dataset)
+
+# remove trailing numbers
+interesting_pathways$dataset = gsub('_[0-9]+', '', interesting_pathways$dataset)
+
+# if a particular dataset is missing a pathway, add it with NA values
+interesting_pathways = interesting_pathways %>%
+  tidyr::complete(Pathway, dataset, fill = list(pvalue = NA, FDR = NA, hits = 0, expected = NA, FC = NA, log2FC = NA, direction = NA))
+
+# when for each dataset:pathway combination there are multiple rows, keep only the one with the lowest pvalue
+interesting_pathways = interesting_pathways %>%
+  group_by(dataset, Pathway) %>%
+  slice_min(Raw.p, n = 1) %>%
+  ungroup()
+
+
+# complete cases
+interesting_pathways = interesting_pathways %>% 
+  tidyr::complete(Pathway, dataset, fill = list(pvalue = NA, FDR = NA, hits = 0, expected = NA, FC = NA, log2FC = NA, direction = NA))
+
+interesting_pathways
+
+```
+
+# Barplot for pathways of interest
+
+```{r}
+# make barplot
+
+# adding negative sign to make tumour appear on the right side, for more intuitive visualisation
+barplot_df = interesting_pathways %>% mutate(log2FC = -log2FC)
+
+# plot the enrichment score barplot
+
+barplot_df %>%
+  ggplot(aes(y = Pathway,
+             x = log2FC, 
+             fill = Pathway)) +
+  
+  # add bars
+  geom_bar(stat = 'identity') +
+  
+  # add border to the bars with p<0.05; make border dashed
+  geom_bar(
+    stat = 'identity',
+    data = barplot_df[barplot_df$Raw.p < 0.05, ],
+    color = 'black',
+    fill = NA,
+    linewidth = 1,
+    linetype = 'dashed') +
+  
+  # colours
+  scale_fill_manual(values = c('#ffae34', '#6388b4', '#55ad89')) +
+  scale_x_continuous(
+    breaks = c(-5,-4,-3,-2,-1, 0, 1, 2, 3, 4, 5),
+    labels = c('', '4', '3', '2', '1', '0', '1', '2', '3', '4', '')) +
+  
+  # add arrows to indicate direction; make them thicker
+  annotate(
+    "segment",
+    x = max(barplot_df$log2FC)-0.6, xend = max(barplot_df$log2FC),
+    y = nrow(barplot_df)+1-0.2, yend = nrow(barplot_df)+1-0.2,
+    size = 1, arrow = arrow(length = unit(0.3, "cm"))) +
+  annotate(
+    "segment",
+    x = min(barplot_df$log2FC)+0.6, xend = min(barplot_df$log2FC),
+    y = nrow(barplot_df)+1-0.2, yend = nrow(barplot_df)+1-0.2,
+    size = 1, arrow = arrow(length = unit(0.3, "cm"))) +
+  
+  # add text annotations above the arrows
+  annotate(
+    "text", x = max(barplot_df$log2FC)-0.1, y = nrow(barplot_df)+1,
+    label = 'Tumour', hjust = 1) +
+  annotate(
+    "text", x = min(barplot_df$log2FC)+0.1, y = nrow(barplot_df)+1,
+    label = 'Benign', hjust = 0) +
+  
+  # add space on top
+  coord_cartesian(ylim = c(0.75, 3.5)) +
+  
+  # add vertical line at 0
+  geom_vline(xintercept = 0,
+             color = 'black',
+             size = 1) +
+  
+  # labels
+  labs(title = 'Pathway enrichment in the epithelial compartment',
+       caption = 'Dashed outline: p < 0.05',
+       x = 'Pathway enrichment score', 
+       y = NULL,
+       fill = NULL,
+       hjust = 0) +
+  
+  # theme
+  theme_minimal() +
+  theme(legend.position = 'none')
+
+ggsave('Images/TCA_GLYCOLYSIS_FASYNTH_pathways_barplot_tumour_vs_benign_twohitplus_sign_dashed_RMS_woBG_biglist.png', 
+       bg = 'white', 
+       width = 6, 
+       height = 4)
+
+```
+
+# Volcano plots for pathways of interest compounds
+```{r}
+# create dataframe for volcano plots
+volc_df = matched_peak_list_ROI[[1]] %>% 
+  filter(grepl('Glycolysis|TCA|Fatty acid biosynthesis', pathway_name)) %>% 
+  select(c(exp_peak, adduct, mean_benign_epithelium, mean_tumour_epithelium, 
+           pvalue, fc, mean_fc, compound_name, pathway_name)) %>% 
+  distinct() 
+
+# process the data for volcano plots
+volc_df = volc_df %>%
+  group_by(exp_peak, pathway_name) %>% 
+  dplyr::summarise(pvalue = mean(pvalue), 
+                   mean_fc = mean(mean_fc), 
+                   compound_name = compound_name) %>% 
+  ungroup() %>% 
+  group_by(compound_name, pathway_name) %>% 
+  dplyr::summarise(pvalue = mean(pvalue), 
+                   mean_fc = mean(mean_fc), 
+                   exp_peak = paste0(exp_peak, collapse = ';'))
+
+# add column for labels
+volc_df$name_labels = volc_df$compound_name
+volc_df$name_labels[duplicated(volc_df$exp_peak)] = ''
+volc_df$name_labels[volc_df$pvalue > 0.05] = ''
+
+# identify compounds belonging to more than one pathway
+double_hit_cpds = volc_df %>% group_by(compound_name) %>% summarise(n = n()) %>% filter(n == 2) %>% pull(compound_name)
+
+# mark these compounds in a separate column
+volc_df = volc_df %>% mutate(double_hit = ifelse(compound_name %in% double_hit_cpds, 1, 0))
+
+# define more human readable names for compounds
+new_cpd_names = volc_df %>% 
+  mutate(name_labels = gsub('\\(S\\)-Lactate', 'Lactate', name_labels)) %>% 
+  mutate(name_labels = gsub('\\(S\\)-Malate', 'Malate', name_labels)) %>% 
+  mutate(name_labels = gsub('\\[Dihydrolipoyllysine-residue acetyltransferase\\] S-acetyldihydrolipoyllysine', 'S-Acetyldihydrolipoamide-E', name_labels)) %>% 
+  mutate(name_labels = gsub('alpha-D-Glucose', 'Glucose', name_labels)) %>% 
+  mutate(name_labels = gsub('\\(9Z\\)-Hexadecenoic acid', 'Palmitoleic acid', name_labels)) %>%
+  mutate(name_labels = gsub('\\(9Z\\)-Octadecenoic acid', 'Oleic acid', name_labels)) %>% 
+  mutate(name_labels = gsub('2-Oxoglutarate', 'alpha-Ketoglutarate', name_labels)) %>% 
+  pull(name_labels)
+
+volc_df$name_labels_fixed = new_cpd_names
+
+# need to swap direction, hence the minus in -log2
+# add log columns
+volc_df$log2fc = -log2(volc_df$mean_fc)
+volc_df$log10p = -log10(volc_df$pvalue)
+
+# plot volcano plots
+volc_df %>% 
+  ggplot(aes(x = log2fc, 
+             y = log10p,
+             color = pathway_name
+             ))+
+  # 0 axis lines
+  geom_vline(xintercept = 0, alpha = 0.5)+
+  geom_hline(yintercept = 0, alpha = 0.5)+
+  # FC threshold line  = 0.5
+  geom_vline(xintercept = c(-0.5, 0.5),
+             linetype = 'dashed',
+             alpha = 0.4) +
+  
+  geom_hline(
+    yintercept = -log10(0.05),
+    linetype = 'dashed',
+    alpha = 0.4
+  ) +
+  
+  geom_point(data = volc_df[volc_df$double_hit == 1 & 
+                              volc_df$pathway_name == 'Glycolysis / Gluconeogenesis',], 
+             aes(x = log2fc, 
+                 y = log10p),
+             shape="\u2BCB", 
+             colour="#ffae34", 
+             size=5)+
+  geom_point(data = volc_df[volc_df$double_hit == 1 & 
+                              volc_df$pathway_name == 'Citrate cycle (TCA cycle)',], 
+             aes(x = log2fc, 
+                 y = log10p),
+             shape="\u2BCA", 
+             colour="#55ad89", 
+             size=5)+
+  geom_point(data = volc_df[volc_df$double_hit == 0,], 
+             aes(x = log2fc, 
+                 y = log10p),
+             size=4)+
+  scale_color_manual(values = c('#ffae34', '#6388b4', '#55ad89'))+ # c('#ffae34', '#6388b4', '#55ad89')
+   geom_text_repel(
+    aes(label = name_labels_fixed),
+    color = 'gray25',
+    size = 4,
+    box.padding = 0.5,
+    max.overlaps = Inf,
+    force = 2, 
+    # always draw lines
+    min.segment.length = 0
+  ) +
+  # remove minor grid lines
+  guides(colour = guide_legend(override.aes = list(size = 5), title = NULL)) +  
+  
+  #xlim(-2,2) +
+  # ylim(0, 3.5) +
+  theme_minimal()+
+  
+  xlab('Log2FC')+
+  ylab('-Log10(p)')+
+  labs(title = 'Differentially regulated metabolites', caption = 'Significance threshold: p < 0.05\nFC threshold: Log2FC > 0.5')+
+  
+  theme(legend.position = 'top',
+        panel.grid.minor = element_blank(),
+        legend.text = element_text(size = 10),
+        axis.text.x = element_text(size = 10),
+        axis.text.y = element_text(size = 10))+
+  # add arrows to indicate direction of change
+  annotate("segment", x = 1.2, xend = 2, y = 13, yend = 13, 
+           size = 1, color = 'gray25',
+           arrow = arrow(length = unit(0.3, "cm"))) +
+  annotate("segment", x = -1.2, xend = -2, y = 13, yend = 13,
+           size = 1, color = 'gray25',
+          arrow = arrow(length = unit(0.3, "cm"))) +
+  # add text to indicate direction of change
+  annotate("text", x = 1.8, y = 13.5, label = "Tumour", size = 4, hjust = 1, color= 'gray25') +
+  annotate("text", x = -1.8, y = 13.5, label = "Benign", size = 4, hjust = 0, color = 'gray25') 
+
+ggsave('Images/TCA_GLYCOLYSIS_FASYNTH_cpds_volcano_tumour_vs_benign_twohitplus_sign_RMS_woBG_biglist.png', bg = 'white', height = 7, width = 7) 
+
+```
+
+# Subtype FC
+
+```{r}
+# repeat the analysis for tumour sub-groups
+
+# because more complex column names have to be selected for each group, using a manual way to produce FC table
+
+# select columns for all categories
+col_benign_epithelium = colnames(roi_data_wo_bg)[grep('benign.*epithelium', colnames(roi_data_wo_bg))]
+
+col_gp4_cribriform = colnames(roi_data_wo_bg)[grep('tumour.*epithelium.*cribri', colnames(roi_data_wo_bg))]
+
+col_gp4_non_cribriform = colnames(roi_data_wo_bg)[grep('tumour.*epithelium.*glomer|tumour.*epithelium.*poorly|tumour.*epithelium.*fused', colnames(roi_data_wo_bg))]
+
+col_gp3 = colnames(roi_data_wo_bg)[grep('tumour.*epithelium.*gp3', colnames(roi_data_wo_bg))]
+
+col_benign_plus_gp3 = c(col_benign_epithelium, col_gp3)
+
+
+# gp4 cribriform vs benign
+gp4_cribriform_vs_benign = roi_data_wo_bg %>%
+  column_to_rownames(var = 'mz') %>%
+  select(c(col_gp4_cribriform, col_benign_epithelium)) %>%
+  mutate(
+    mean_gp4_cribriform = rowMeans(.[col_gp4_cribriform]),
+    mean_benign_epithelium = rowMeans(.[col_benign_epithelium]),
+    fc = mean_gp4_cribriform / mean_benign_epithelium,
+    log2fc = log2(fc)
+  ) %>%
+  drop_na() %>%
+  mutate(
+    pvalue = sapply(1:nrow(.), function(i)
+      wilcox.test(
+        as.numeric(.[i, col_gp4_cribriform]),
+        as.numeric(.[i, col_benign_epithelium]),
+        paired = FALSE,
+        exact = FALSE
+      )$p.value),
+    pvalue_adj = p.adjust(pvalue, method = 'BH'),
+    mode = 'negative'
+  ) %>% 
+  select(
+    mean_gp4_cribriform,
+    mean_benign_epithelium,
+    fc,
+    log2fc,
+    pvalue,
+    pvalue_adj,
+    mode
+  ) %>% 
+  rownames_to_column('mz')
+
+# gp4 non cribriform vs benign
+gp4_non_cribriform_vs_benign = roi_data_wo_bg %>%
+  column_to_rownames(var = 'mz') %>%
+  select(c(col_gp4_non_cribriform, col_benign_epithelium)) %>%
+  mutate(
+    mean_gp4_non_cribriform = rowMeans(.[col_gp4_non_cribriform]),
+    mean_benign_epithelium = rowMeans(.[col_benign_epithelium]),
+    fc = mean_gp4_non_cribriform / mean_benign_epithelium,
+    log2fc = log2(fc)
+  ) %>%
+  drop_na() %>%
+  mutate(
+    pvalue = sapply(1:nrow(.), function(i)
+      wilcox.test(
+        as.numeric(.[i, col_gp4_non_cribriform]),
+        as.numeric(.[i, col_benign_epithelium]),
+        paired = FALSE,
+        exact = FALSE
+      )$p.value),
+    pvalue_adj = p.adjust(pvalue, method = 'BH'),
+    mode = 'negative'
+  ) %>% 
+  select(
+    mean_gp4_non_cribriform,
+    mean_benign_epithelium,
+    fc,
+    log2fc,
+    pvalue,
+    pvalue_adj,
+    mode
+  ) %>% 
+  rownames_to_column('mz')
+
+# gp4 cribriform vs gp3
+gp4_cribriform_vs_gp3 = roi_data_wo_bg %>%
+  column_to_rownames(var = 'mz') %>%
+  select(c(col_gp4_cribriform, col_gp3)) %>%
+  mutate(
+    mean_gp4_cribriform = rowMeans(.[col_gp4_cribriform]),
+    mean_gp3 = rowMeans(.[col_gp3]),
+    fc = mean_gp4_cribriform / mean_gp3,
+    log2fc = log2(fc)
+  ) %>%
+  drop_na() %>%
+  mutate(
+    pvalue = sapply(1:nrow(.), function(i)
+      wilcox.test(
+        as.numeric(.[i, col_gp4_cribriform]),
+        as.numeric(.[i, col_gp3]),
+        paired = FALSE,
+        exact = FALSE
+      )$p.value),
+    pvalue_adj = p.adjust(pvalue, method = 'BH'),
+    mode = 'negative'
+  ) %>% 
+  select(
+    mean_gp4_cribriform,
+    mean_gp3,
+    fc,
+    log2fc,
+    pvalue,
+    pvalue_adj,
+    mode
+  ) %>% 
+  rownames_to_column('mz')
+
+# gp4 non cribriform vs gp3
+gp4_non_cribriform_vs_gp3 = roi_data_wo_bg %>%
+  column_to_rownames(var = 'mz') %>%
+  select(c(col_gp4_non_cribriform, col_gp3)) %>%
+  mutate(
+    mean_gp4_non_cribriform = rowMeans(.[col_gp4_non_cribriform]),
+    mean_gp3 = rowMeans(.[col_gp3]),
+    fc = mean_gp4_non_cribriform / mean_gp3,
+    log2fc = log2(fc)
+  ) %>%
+  drop_na() %>%
+  mutate(
+    pvalue = sapply(1:nrow(.), function(i)
+      wilcox.test(
+        as.numeric(.[i, col_gp4_non_cribriform]),
+        as.numeric(.[i, col_gp3]),
+        paired = FALSE,
+        exact = FALSE
+      )$p.value),
+    pvalue_adj = p.adjust(pvalue, method = 'BH'),
+    mode = 'negative'
+  ) %>% 
+  select(
+    mean_gp4_non_cribriform,
+    mean_gp3,
+    fc,
+    log2fc,
+    pvalue,
+    pvalue_adj,
+    mode
+  ) %>% 
+  rownames_to_column('mz')
+
+# gp4 non cribriform vs col_benign_plus_gp3
+gp4_non_cribriform_vs_benign_plus_gp3 = roi_data_wo_bg %>%
+  column_to_rownames(var = 'mz') %>%
+  select(c(col_gp4_non_cribriform, col_benign_plus_gp3)) %>%
+  mutate(
+    mean_gp4_non_cribriform = rowMeans(.[col_gp4_non_cribriform]),
+    mean_benign_plus_gp3 = rowMeans(.[col_benign_plus_gp3]),
+    fc = mean_gp4_non_cribriform / mean_benign_plus_gp3,
+    log2fc = log2(fc)
+  ) %>%
+  drop_na() %>%
+  mutate(
+    pvalue = sapply(1:nrow(.), function(i)
+      wilcox.test(
+        as.numeric(.[i, col_gp4_non_cribriform]),
+        as.numeric(.[i, col_benign_plus_gp3]),
+        paired = FALSE,
+        exact = FALSE
+      )$p.value),
+    pvalue_adj = p.adjust(pvalue, method = 'BH'),
+    mode = 'negative'
+  ) %>% 
+  select(
+    mean_gp4_non_cribriform,
+    mean_benign_plus_gp3,
+    fc,
+    log2fc,
+    pvalue,
+    pvalue_adj,
+    mode
+  ) %>% 
+  rownames_to_column('mz')
+
+# gp4 cribriform vs col_benign_plus_gp3
+gp4_cribriform_vs_benign_plus_gp3 = roi_data_wo_bg %>%
+  column_to_rownames(var = 'mz') %>%
+  select(c(col_gp4_cribriform, col_benign_plus_gp3)) %>%
+  mutate(
+    mean_gp4_cribriform = rowMeans(.[col_gp4_cribriform]),
+    mean_benign_plus_gp3 = rowMeans(.[col_benign_plus_gp3]),
+    fc = mean_gp4_cribriform / mean_benign_plus_gp3,
+    log2fc = log2(fc)
+  ) %>%
+  drop_na() %>%
+  mutate(
+    pvalue = sapply(1:nrow(.), function(i)
+      wilcox.test(
+        as.numeric(.[i, col_gp4_cribriform]),
+        as.numeric(.[i, col_benign_plus_gp3]),
+        paired = FALSE,
+        exact = FALSE
+      )$p.value),
+    pvalue_adj = p.adjust(pvalue, method = 'BH'),
+    mode = 'negative'
+  ) %>% 
+  select(
+    mean_gp4_cribriform,
+    mean_benign_plus_gp3,
+    fc,
+    log2fc,
+    pvalue,
+    pvalue_adj,
+    mode
+  ) %>% 
+  rownames_to_column('mz')
+
+# gp4 cribriform vs gp4 non cribriform
+gp4_cribriform_vs_gp4_non_cribriform = roi_data_wo_bg %>%
+  column_to_rownames(var = 'mz') %>%
+  select(c(col_gp4_cribriform, col_gp4_non_cribriform)) %>%
+  mutate(
+    mean_gp4_cribriform = rowMeans(.[col_gp4_cribriform]),
+    mean_gp4_non_cribriform = rowMeans(.[col_gp4_non_cribriform]),
+    fc = mean_gp4_cribriform / mean_gp4_non_cribriform,
+    log2fc = log2(fc)
+  ) %>%
+  drop_na() %>%
+  mutate(
+    pvalue = sapply(1:nrow(.), function(i)
+      wilcox.test(
+        as.numeric(.[i, col_gp4_cribriform]),
+        as.numeric(.[i, col_gp4_non_cribriform]),
+        paired = FALSE,
+        exact = FALSE
+      )$p.value),
+    pvalue_adj = p.adjust(pvalue, method = 'BH'),
+    mode = 'negative'
+  ) %>% 
+  select(
+    mean_gp4_cribriform,
+    mean_gp4_non_cribriform,
+    fc,
+    log2fc,
+    pvalue,
+    pvalue_adj,
+    mode
+  ) %>% 
+  rownames_to_column('mz')
+
+# save results
+write.csv(gp4_cribriform_vs_benign, 'Data/gp4_cribriform_vs_benign_neg_RMS_woBG_biglist_fc_pval_results.csv', row.names = F)
+write.csv(gp4_non_cribriform_vs_benign, 'Data/gp4_non_cribriform_vs_benign_neg_RMS_woBG_biglist_fc_pval_results.csv', row.names = F)
+write.csv(gp4_cribriform_vs_gp3, 'Data/gp4_cribriform_vs_gp3_neg_RMS_woBG_biglist_fc_pval_results.csv', row.names = F)
+write.csv(gp4_non_cribriform_vs_gp3, 'Data/gp4_non_cribriform_vs_gp3_neg_RMS_woBG_biglist_fc_pval_results.csv', row.names = F)
+write.csv(gp4_cribriform_vs_benign_plus_gp3, 'Data/gp4_cribriform_vs_benign_plus_gp3_neg_RMS_woBG_biglist_fc_pval_results.csv', row.names = F)
+write.csv(gp4_non_cribriform_vs_benign_plus_gp3, 'Data/gp4_non_cribriform_vs_benign_plus_gp3_neg_RMS_woBG_biglist_fc_pval_results.csv', row.names = F)
+write.csv(gp4_cribriform_vs_gp4_non_cribriform, 'Data/gp4_cribriform_vs_gp4_non_cribriform_neg_RMS_woBG_biglist_fc_pval_results.csv', row.names = F)
+
+
+# path for results (for pathway analysis)
+result_files_subtype = list.files(path = 'Data', pattern = 'gp4.*neg_RMS_woBG_biglist_fc_pval_results', full.names = T)
+
+
+```
+
+# Subtype ORA
+
+```{r}
+
+# perform peak mapping for all sub datasets
+matched_peak_list_ROI_subtype = lapply(result_files_subtype, function(x) {
+  
+  customPeakMap(kegg_path = kegg_path, 
+                results_path = x, 
+                path_size = 2, 
+                ppm = 5, 
+                mode = mode)
+})
+
+# name the list
+names(matched_peak_list_ROI_subtype) = gsub('Data/|.neg.*', '', result_files_subtype)
+
+# filter out entries without pathway
+filt_matched_peak_list_ROI_subtype = lapply(matched_peak_list_ROI_subtype, function(x) x[x$pathway_id != '',])
+
+# filter out non-significant entries
+filt_matched_peak_list_ROI_subtype = lapply(filt_matched_peak_list_ROI_subtype, function(x) x[x$pvalue <= 0.05,])
+
+
+# split into up- and down-regulated based on FC
+p005up_list_subtype = lapply(filt_matched_peak_list_ROI_subtype, function(x) x[x$mean_fc > 1,])
+p005down_list_subtype = lapply(filt_matched_peak_list_ROI_subtype, function(x) x[x$mean_fc < 1,])
+
+# get the unique peaks
+uniq_sign_peaks_up_list_subtype = lapply(p005up_list_subtype, function(x) unique(x$mz))
+uniq_sign_peaks_down_list_subtype = lapply(p005down_list_subtype, function(x) unique(x$mz))
+
+# compute ORA
+ora_up_list_subtype = lapply(uniq_sign_peaks_up_list_subtype, function(x) {
+  if (length(x) != 0) {
+    compute_ORA(cpd_vector = x, path_set = pathway2peaks_human, hit_filt = 2)}})
+
+ora_down_list_subtype = lapply(uniq_sign_peaks_down_list_subtype, function(x) {
+  if (length(x) != 0) {
+    compute_ORA(cpd_vector = x, path_set = pathway2peaks_human, hit_filt = 2)}})
+
+# add direction to the ORA results
+ora_up_list_subtype = lapply(ora_up_list_subtype, function(x) cbind(x, direction = 'up'))
+ora_down_list_subtype = lapply(ora_down_list_subtype, function(x) cbind(x, direction = 'down'))
+
+# combine up- and down-regulated ORA results
+ora_list_subtype = lapply(1:length(ora_up_list_subtype), function(x) rbind(ora_up_list_subtype[[x]], ora_down_list_subtype[[x]]))
+
+names(ora_list_subtype) = gsub('Data/|.neg.*', '', result_files_subtype)
+
+# drop comparisons without any pathways (keep only comparisons that are data frames)
+ora_list_subtype = ora_list_subtype[lapply(ora_list_subtype, class) == 'data.frame']
+
+# process ORA results
+ora_list_subtype = lapply(ora_list_subtype, function(x) {
+  x %>%
+  dplyr::mutate(FC = hits/expected, .after = FDR) %>% 
+  dplyr::mutate(log2FC = log2(hits/expected), .after = FC) %>% 
+  mutate(FC = ifelse(direction == 'down', FC*-1, FC)) %>% 
+  mutate(log2FC = ifelse(direction == 'down', log2FC*-1, log2FC)) %>% 
+  rownames_to_column('Pathway') %>%
+  # remove number 1 from the ends of the pathway names (appears after merging two dfs when both up and down regulated df has the pathway)
+  mutate(Pathway = gsub('1$', '', Pathway))
+  
+})
+
+```
+
+
+# Subtype GTF pathways 
+
+```{r}
+# check if Glycolysis is in the list
+lapply(ora_list_subtype, function(x) any(grepl('Glycolysis', x$Pathway)))
+
+# check if TCA cycle is in the list
+lapply(ora_list_subtype, function(x) any(grepl('TCA', x$Pathway)))
+
+# check if FA synthesis is in the list
+lapply(ora_list_subtype, function(x) any(grepl('Fatty acid', x$Pathway)))
+
+```
+
+```{r}
+# get data for interesting pathways
+interesting_pathways = data.frame()
+for (i in 1:length(ora_list_subtype)) {
+  # add dataset name as a column
+  temp_path = ora_list_subtype[[i]]
+  temp_path$dataset = names(ora_list_subtype)[i]
+  # filter out only interesting pathways
+  temp_path = temp_path[grepl('Glycolysis|TCA|Fatty acid biosynthesis', temp_path$Pathway),]
+  # add to the main df
+  interesting_pathways = rbind(interesting_pathways, temp_path)
+}
+
+# remove 'epithelium' from the dataset names
+interesting_pathways$dataset = gsub('_epithelium', '', interesting_pathways$dataset)
+# remove ".neg" and everything after 
+interesting_pathways$dataset = gsub('\\.neg.*', '', interesting_pathways$dataset)
+
+# remove trailing numbers
+interesting_pathways$dataset = gsub('_[0-9]+', '', interesting_pathways$dataset)
+
+# if a particular dataset is missing a pathway, add it with NA values
+interesting_pathways = interesting_pathways %>%
+  tidyr::complete(Pathway, dataset, fill = list(pvalue = NA, FDR = NA, hits = 0, expected = NA, FC = NA, log2FC = NA, direction = NA))
+
+# when for each dataset:pathway combination there are multiple rows, keep only the one with the lowest pvalue
+interesting_pathways = interesting_pathways %>%
+  group_by(dataset, Pathway) %>%
+  slice_min(Raw.p, n = 1) %>%
+  ungroup()
+
+# complete cases
+interesting_pathways = interesting_pathways %>% 
+  tidyr::complete(Pathway, dataset, fill = list(pvalue = NA, FDR = NA, hits = 0, expected = NA, FC = NA, log2FC = NA, direction = NA))
+
+interesting_pathways
+
+```
+
+
+# Subtype GTF all group comparison
+```{r}
+
+# filter to keep onlypathways with >1 hits
+interesting_pathways_filt = interesting_pathways %>% filter(hits > 1) %>% mutate(dataset = factor(dataset))
+
+unique(interesting_pathways_filt$dataset)
+
+# make better axis labels
+labels_right_filt = sapply(str_split(unique(interesting_pathways_filt$dataset), pattern = '_vs_'), function(x) x[1])
+labels_right_filt = str_to_title(gsub('_', ' ', labels_right_filt))
+labels_right_filt = gsub('Non ', 'Non-', labels_right_filt)
+
+labels_left_filt = sapply(str_split(unique(interesting_pathways_filt$dataset), pattern = '_vs_'), function(x) x[2])
+labels_left_filt = str_to_title(gsub('_', ' ', labels_left_filt))
+labels_left_filt = gsub(' Plus ', '+', labels_left_filt)
+labels_left_filt = gsub('Non ', 'Non-', labels_left_filt)
+
+# plot 
+interesting_pathways_filt %>% 
+  ggplot(aes(x = log2FC, 
+             y = as.numeric(dataset), 
+             #y = dataset, 
+             color = Pathway, 
+             size = -log10(Raw.p),
+            # size = coverage
+             )
+         ) +
+  geom_vline(xintercept = 0, linetype = 'dashed', color = 'grey50')+
+  geom_point(data = interesting_pathways_filt[interesting_pathways_filt$Raw.p < 0.05,] %>% drop_na(), shape = 21, aes(fill = Pathway), color = 'black', stroke = 1.5)+
+  geom_point(data = interesting_pathways_filt[interesting_pathways_filt$Raw.p > 0.05,] %>% drop_na())+
+  scale_size_continuous(range=c(3,8))+
+  # vertical line at 0
+  theme_minimal()+
+  # legend on the bottom
+  theme(legend.position = 'right')+
+  labs(x = 'Enrichment', y = NULL, size = '-log10(p)', color = 'Pathway')+
+  # funky color palette not viridis
+  scale_color_manual(values = c('#ffae34', '#6388b4', '#55ad89'))+
+  scale_fill_manual(values = c('#ffae34', '#6388b4', '#55ad89'))+
+  # make legend point size bigger
+  guides(colour = guide_legend(override.aes = list(size=5)))+
+  # make x axis symmetric
+  # scale_x_continuous(limits = c(-4.6, 4.6))+
+  # remove horizontal grid lines
+  theme(panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank())+
+  # add labels to the left and right
+  scale_y_continuous(breaks = seq_along(labels_left_filt), 
+                     labels = labels_left_filt, 
+                     sec.axis = sec_axis(~., breaks = seq_along(labels_left_filt), labels = labels_right_filt))+
+  # # assign custom tick labels for x axis
+  scale_x_continuous(breaks = c(-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5), 
+                     labels = c('', '4','3', '2', '1', '0', '1', '2', '3', '4', ''))+
+  # add title in the middle
+  labs(title = 'Pathway enrichment in the epithelial compartment', caption = 'Black outline: p<0.05')+
+  # add horizontal lines sepparating different conditions ()
+  geom_hline(yintercept = (seq_along(labels_left_filt)+0.5)[1:length(labels_left_filt)-1], color = 'grey95')
+
+ggsave('Images/TCA_GLYCOLYSIS_FASYNTH_pathways_bubble_all_contrasts_twohitplus_sign_v2.png', bg = 'white', width = 8, height = 5)
+```
+
+
+# Truncated plot
+
+```{r}
+contrasts_to_keep = c('gp4_non_cribriform_vs_benign_plus_gp3', 
+                      'gp4_cribriform_vs_benign_plus_gp3', 
+                      'gp4_cribriform_vs_gp4_non_cribriform')
+
+truncated_df = interesting_pathways_filt %>% 
+  filter(dataset %in% contrasts_to_keep) %>% 
+  mutate(dataset = droplevels(dataset)) %>% 
+  mutate(dataset = factor(dataset, levels = contrasts_to_keep))
+
+
+
+labels_right_filt = sapply(str_split(unique(contrasts_to_keep), pattern = '_vs_'), function(x) x[1])
+labels_right_filt = str_to_title(gsub('_', ' ', labels_right_filt))
+labels_right_filt = gsub('Non ', 'Non-', labels_right_filt)
+
+labels_left_filt = sapply(str_split(unique(contrasts_to_keep), pattern = '_vs_'), function(x) x[2])
+labels_left_filt = str_to_title(gsub('_', ' ', labels_left_filt))
+labels_left_filt = gsub(' Plus ', '+', labels_left_filt)
+labels_left_filt = gsub('Non ', 'Non-', labels_left_filt)
+
+truncated_df %>% 
+  ggplot(aes(x = log2FC, 
+             y = as.numeric(dataset), 
+             #y = c(1,2,3,4,5,6),
+             color = Pathway, 
+             size = -log10(Raw.p),
+             )
+         ) +
+  geom_vline(xintercept = 0, 
+             linetype = 'dashed', 
+             color = 'grey50')+
+  geom_point(data = truncated_df[truncated_df$Raw.p < 0.05,] %>% drop_na(), 
+             shape = 21, 
+             aes(fill = Pathway), 
+             color = 'black', 
+             stroke = 1.5)+
+  geom_point(data = truncated_df[truncated_df$Raw.p > 0.05,] %>% drop_na()) +
+  scale_size_continuous(range=c(3,8))+
+  # vertical line at 0
+  theme_minimal()+
+  # legend on the bottom
+  theme(legend.position = 'right')+
+  labs(x = 'Enrichment', y = NULL, size = '-log10(p)', color = 'Pathway')+
+  # funky color palette not viridis
+  scale_color_manual(values = c('#ffae34', '#6388b4', '#55ad89'))+
+  scale_fill_manual(values = c('#ffae34', '#6388b4', '#55ad89'))+
+  # make legend point size bigger
+  guides(colour = guide_legend(override.aes = list(size=5)), fill = 'none')+
+  # make x axis symmetric
+  # scale_x_continuous(limits = c(-4.6, 4.6))+
+  # remove horizontal grid lines
+  theme(panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        plot.margin = margin(t = 0,  # Top margin
+                             r = 0,  # Right margin
+                             b = 0,  # Bottom margin
+                             l = 0)
+        )+
+  # add labels to the left and right
+  scale_y_continuous(breaks = seq_along(labels_left_filt),
+                     labels = labels_left_filt,
+                     sec.axis = sec_axis(~., breaks = seq_along(labels_right_filt), labels = labels_right_filt))+
+  # # assign custom tick labels for x axis
+  scale_x_continuous(breaks = c(-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5),
+                     labels = c('', '4','3', '2', '1', '0', '1', '2', '3', '4', ''))+
+  # add title in the middle
+  labs(title = 'Pathway enrichment in the epithelial compartment', caption = 'Black outline: p<0.05')+
+  # add horizontal lines sepparating different conditions ()
+  geom_hline(yintercept = (seq_along(labels_left_filt)+0.5)[1:length(labels_left_filt)-1], color = 'grey95')+
+  coord_cartesian(clip = "off")
+
+ggsave('Images/GTF_pathways_bubble_all_contrasts_twohitplus_sign_v2_truncated.pdf', bg = 'white', width = 8, height = 3, device = cairo_pdf)
+
+
+```
+
+# Volcano for pathway of interest compounds
+
+```{r}
+# create a list of datafraes for plotting volcano plots
+volc_df_list = lapply(matched_peak_list_ROI_subtype, function(x) {
+  x[,c(1:8,12,22)] %>%
+  filter(grepl('Glycolysis|TCA|Fatty acid biosynthesis', pathway_name)) %>% 
+  filter(pathway_name != '') %>%
+  distinct() %>%
+  left_join(bg_peaks %>% mutate(mz = round(mz, 4)), by = c('exp_peak' = 'mz'), suffix = c('', '_bg')) # join with background table
+    
+})
+
+```
+
+```{r}
+
+# rename compound names
+volc_df_list_for_volcanoes = lapply(volc_df_list, function(x){
+  volc_df = x %>% 
+  mutate(compound_name = gsub('\\(S\\)-Lactate', 'Lactate', compound_name)) %>% 
+  mutate(compound_name = gsub('\\(S\\)-Malate', 'Malate', compound_name)) %>% 
+  mutate(compound_name = gsub('\\[Dihydrolipoyllysine-residue acetyltransferase\\] S-acetyldihydrolipoyllysine', 'S-Acetyldihydrolipoamide-E', compound_name)) %>% 
+  mutate(compound_name = gsub('alpha-D-Glucose', 'Glucose', compound_name)) %>% 
+  mutate(compound_name = gsub('D-|beta-|beta-D-', '', compound_name)) %>% 
+  mutate(compound_name = gsub('\\(9Z\\)-Hexadecenoic acid', 'Palmitoleic acid', compound_name)) %>%
+  mutate(compound_name = gsub('\\(9Z\\)-Octadecenoic acid', 'Oleic acid', compound_name)) %>% 
+  mutate(compound_name = gsub('2-Oxoglutarate', 'alpha-Ketoglutarate', compound_name)) %>% 
+  
+  group_by(exp_peak, pathway_name) %>% 
+  dplyr::reframe(pvalue = mean(pvalue), 
+                   mean_fc = mean(mean_fc), 
+                   compound_name = paste0(unique(compound_name), collapse = ';')) %>% 
+  ungroup() %>% 
+  group_by(compound_name, pathway_name) %>% 
+  dplyr::reframe(pvalue = mean(pvalue), 
+                   mean_fc = mean(mean_fc), 
+                   exp_peak = paste0(unique(exp_peak), collapse = ';')) %>% 
+  
+  mutate(compound_name = gsub(';Malate', '', compound_name)) %>% 
+  mutate(compound_name = gsub(';Isocitrate', '', compound_name)) %>% 
+  mutate(compound_name = gsub(';Oxaloacetate', '', compound_name)) %>% 
+  mutate(compound_name = gsub('cis-Aconitate;Citrate', 'Citrate', compound_name)) %>% 
+  mutate(compound_name = gsub(';Glucose 6-phosphate;Fructose 6-phosphate', '', compound_name)) %>% 
+  mutate(compound_name = gsub('3-Phospho-glyceroyl phosphate;2,3-Bisphospho-glycerate', 'Glycerate 1,3-biphosphate', compound_name))
+  
+  volc_df$name_labels = volc_df$compound_name
+  volc_df$name_labels[duplicated(volc_df$exp_peak)] = ''
+  volc_df$name_labels[volc_df$pvalue > 0.05] = ''
+  
+  double_hit_cpds = volc_df %>% group_by(compound_name) %>% summarise(n = n()) %>% filter(n == 2) %>% pull(compound_name)
+  print(double_hit_cpds)
+
+  volc_df = volc_df %>% mutate(double_hit = ifelse(compound_name %in% double_hit_cpds, 1, 0))
+  
+  volc_df$log10p = -log10(volc_df$pvalue)
+  volc_df$log2fc = log2(volc_df$mean_fc)
+  
+  volc_df
+  
+})
+
+```
+
+
+```{r}
+# volcano plot for each element in the list
+volc_plot_list = lapply(seq_along(volc_df_list_for_volcanoes), function(x){
+
+  name = names(volc_df_list_for_volcanoes)[x]
+  label_right = str_split(name, '_vs_', simplify = TRUE)[1]
+  label_right = str_to_title(gsub('_', ' ', label_right))
+  label_right = gsub(' Plus ', '+', label_right)
+  label_right = gsub('Non ', 'Non-', label_right)
+
+  label_left = str_split(name, '_vs_', simplify = TRUE)[2]
+  label_left = str_to_title(gsub('_', ' ', label_left))
+  label_left = gsub(' Plus ', '+', label_left)
+  label_left = gsub('Non ', 'Non-', label_left)
+  
+  volc_df = volc_df_list_for_volcanoes[[x]]
+  
+  # max y coordinate
+  max_y = max(volc_df$log10p)+1
+  
+  # max x coordinate
+  max_x = max(abs(volc_df$log2fc))
+  
+  # min x coordinate
+  min_x = -max_x
+
+  volc_df %>% 
+    ggplot(aes(x = log2fc, 
+                y = log10p,
+                color = pathway_name
+                ))+
+    # 0 axis lines
+    geom_vline(xintercept = 0, alpha = 0.5)+
+    geom_hline(yintercept = 0, alpha = 0.5)+
+    # FC threshold line  = 0.5
+    geom_vline(xintercept = c(-0.5, 0.5),
+                linetype = 'dashed',
+                alpha = 0.4) +
+    
+    geom_hline(
+      yintercept = -log10(0.05),
+      linetype = 'dashed',
+      alpha = 0.4
+    ) +
+    
+    geom_point(data = volc_df[volc_df$double_hit == 1,],
+                aes(x = log2fc,
+                    y = log10p),
+                # shape="\u2BCB",
+                shape="\u25D2", # for mac
+                colour="#ffae34",
+                size=4)+
+    geom_point(data = volc_df[volc_df$double_hit == 1,],
+                aes(x = log2fc,
+                    y = log10p),
+                # shape="\u2BCA",
+                shape = '\u25D3', # for mac
+                colour="#55ad89",
+                size=4)+
+    
+    geom_point(data = volc_df[volc_df$double_hit == 0,], 
+                aes(x = log2fc, 
+                    y = log10p),
+                size=4)+
+    scale_color_manual(values = c('#ffae34', '#6388b4', '#55ad89')) + # c('#ffae34', '#6388b4', '#55ad89')
+      
+    geom_text_repel(
+      aes(label = name_labels),
+      color = 'gray25',
+      size = 6,
+      box.padding = 0.5,
+      point.padding = 0.5,
+      max.overlaps = Inf,
+      force = 2, nudge_y = 0.1,
+      # always draw lines
+      min.segment.length = 0.5, max.time = 2, max.iter = 50000
+    ) +
+    # remove minor grid lines
+    guides(colour = guide_legend(override.aes = list(size = 5), title = NULL)) +  
+    
+    #xlim(-2,2) +
+    # ylim(0, 3.5) +
+    theme_minimal(base_family = "DejaVu Sans")+
+    
+    xlab('Log2FC')+
+    ylab('-Log10(p)')+
+    labs(title = 'Differentially regulated metabolites', 
+         caption = 'Significance threshold: p < 0.05\nFC threshold: Log2FC > 0.5')+
+    
+    theme(legend.position = 'top',
+          panel.grid.minor = element_blank(),
+          legend.text = element_text(size = 12),
+          axis.text.x = element_text(size = 12),
+          axis.text.y = element_text(size = 12))+
+    
+    # add text to indicate direction of change
+    annotate("text", x = max_x*1.1, y = max_y*1.1, label = paste0(label_right,"►"), size = 6, 
+             fontface = "bold", family = "Arial", hjust = 1, color= 'gray25') +
+    annotate("text", x = min_x*1.1, y = max_y*1.1, label = paste0("◄",label_left), size = 6, 
+         fontface = "bold", family = "Arial", hjust = 0, color = 'gray25')+
+
+
+    # make x axis symmetric
+    coord_cartesian(xlim = c(min_x*1.1, max_x*1.1))
+
+  
+})
+names(volc_plot_list) = names(volc_df_list_for_volcanoes)
+
+volc_plot_list
+
+# save all plots
+lapply(seq_along(volc_plot_list), function(x){
+  name = names(volc_plot_list)[x]
+  ggsave(paste0('Images/TCA_GLYCOLYSIS_FASYNTH_cpds_volcano_', name, '_min2hit_sign_RMS_woBG_biglist.png'), volc_plot_list[[x]], bg = 'white', height = 7, width = 7)
+})
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# extract peaks for interesting pathways for Jack's SHAP analysis
+
+```{r}
+
+
+manual_bg_checked_peaks = c(125.0009, 127.0037, 180.9895, 171.1390, 181.1599, 199.1707, 143.1078, 122.9851, 259.0222)
+
+
+export_df = matched_peak_list_ROI[["benign_epithelium.tumour_epithelium"]] %>% 
+  filter(str_detect(pathway_name, 'Citrate cycle|Glycolysis|Fatty acid')) %>%
+  group_by(exp_peak) %>% 
+  summarise(compound_name = paste0(unique(compound_name), collapse = ';'),
+            fc = paste0(unique(fc), collapse = ';'),
+            mean_benign_epithelium = paste0(unique(mean_benign_epithelium), collapse = ';'),
+            mean_tumour_epithelium = paste0(unique(mean_tumour_epithelium), collapse = ';'),
+            ) %>% 
+  left_join(bg_peaks %>% mutate(mz = round(mz,4)), by = c('exp_peak' = 'mz')) %>% 
+  filter(!exp_peak %in% manual_bg_checked_peaks) %>% 
+  left_join(peaks_and_tolerances %>% mutate(m_z = round(m_z,4)), by = c('exp_peak'='m_z'))
+
+export_df = export_df %>% 
+  mutate(compound_name = gsub('\\(S\\)-Lactate', 'Lactate', compound_name)) %>% 
+  mutate(compound_name = gsub('\\(S\\)-Malate', 'Malate', compound_name)) %>% 
+  mutate(compound_name = gsub('\\[Dihydrolipoyllysine-residue acetyltransferase\\] S-acetyldihydrolipoyllysine', 'S-Acetyldihydrolipoamide-E', compound_name)) %>% 
+  mutate(compound_name = gsub('alpha-D-Glucose', 'Glucose', compound_name)) %>% 
+  mutate(compound_name = gsub('\\(9Z\\)-Hexadecenoic acid', 'Palmitoleic acid', compound_name)) %>%
+  mutate(compound_name = gsub('\\(9Z\\)-Octadecenoic acid', 'Oleic acid', compound_name)) %>% 
+  mutate(compound_name = gsub('2-Oxoglutarate', 'alpha-Ketoglutarate', compound_name))
+
+export_df = export_df %>% 
+  mutate(compound_name = gsub('D-|beta-|beta-D-', '', compound_name)) %>% 
+  mutate(compound_name = gsub(';Malate', '', compound_name)) %>% 
+  mutate(compound_name = gsub(';Oxaloacetate', '', compound_name)) %>% 
+  mutate(compound_name = gsub(';Isocitrate', '', compound_name)) %>% 
+  mutate(compound_name = gsub(';Glucose;Glucose', '', compound_name)) %>% 
+  mutate(compound_name = gsub(';Glucose 6-phosphate;Glucose 6-phosphate;Fructose 6-phosphate', '', compound_name)) %>% 
+  mutate(compound_name = gsub('3-Phospho-glyceroyl phosphate;2,3-Bisphospho-glycerate', 'Glycerate 1,3-biphosphate', compound_name))
+
+
+write.csv(
+  export_df %>% select(exp_peak, interval_width_da, compound_name),
+  'Data/TCA_glyc_fas_metabolites_V2.csv', row.names = F
+)
+  
+
+```
+
+
+
+
+
+
+
+
+
